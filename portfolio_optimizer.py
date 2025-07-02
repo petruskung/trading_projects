@@ -738,11 +738,6 @@ with mr_tab:
         summary_train = compute_portfolio_summary(cum_train)
         summary_test  = compute_portfolio_summary(cum_test)    
 
-# --------------------------------------------------
-# immediately after you do:
-#     cum_train = ...
-#     cum_test  = ...
-
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Portfolio Summary – Train Set")
