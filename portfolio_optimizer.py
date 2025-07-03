@@ -21,17 +21,64 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# ─── Data Loaders ─────────────────────────────────────────────────────────────
+# ─── Data Loaders ────────────────────────────────────────────────────────
 
 @st.cache_data
-def load_sp500_tickers() -> list[str]:
+def load_european_tickers() -> List[str]:
+    """
+    Scrape constituents from major European index Wiki pages,
+    append the correct Yahoo suffix, and return a sorted unique list.
+    """
+    idx_info = {
+        "FTSE100":  ("https://en.wikipedia.org/wiki/FTSE_100",           ["Ticker"],           [".L"]),
+        "DAX":      ("https://en.wikipedia.org/wiki/DAX",                ["Ticker"],           [""]),
+        "CAC40":    ("https://en.wikipedia.org/wiki/CAC_40",             ["Ticker"],           [""]),
+        "AEX":      ("https://en.wikipedia.org/wiki/AEX_index",          ["Ticker symbol"],    [".AS"]),
+        "FTSEMIB":  ("https://en.wikipedia.org/wiki/FTSE_MIB",           ["Ticker"],           [""]),
+        "SMI":      ("https://en.wikipedia.org/wiki/Swiss_Market_Index", ["Ticker"],           [""]),
+    }
+
+    all_tickers: List[str] = []
+
+    for name, (url, col_candidates, suffixes) in idx_info.items():
+        tables = pd.read_html(url, header=0)
+        found = False
+        for df in tables:
+            # normalize column names
+            df = df.rename(columns=lambda c: str(c).strip())
+            # try each candidate until one matches
+            for col in col_candidates:
+                if col in df.columns:
+                    syms = (
+                        df[col]
+                        .dropna()
+                        .astype(str)
+                        .str.strip()
+                        .unique()
+                    )
+                    # combine each raw symbol with each suffix
+                    for sym in syms:
+                        for suf in suffixes:
+                            all_tickers.append(f"{sym}{suf}")
+                    found = True
+                    break  # no need to try other col names
+
+            if found:
+                break  
+        if not found:
+            st.warning(f"⚠️ Could not find any of {col_candidates} on {name} page")
+    return sorted(set(all_tickers))
+
+
+@st.cache_data
+def load_sp500_tickers() -> List[str]:
     """
     Scrape the S&P 500 constituents from Wikipedia and return a sorted list of tickers.
     """
     url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-    tables = pd.read_html(url, header=0)
-    df  = tables[0]
+    df = pd.read_html(url, header=0)[0]
     return df["Symbol"].sort_values().tolist()
+
 
 @st.cache_data
 def fetch_price_data(
@@ -58,17 +105,16 @@ def fetch_price_data(
 
     # MultiIndex: first level is ticker
     if isinstance(data.columns, pd.MultiIndex):
-        tickers_list = data.columns.levels[0]
+        symbols = data.columns.levels[0]
         try:
             prices = pd.concat(
-                [data[tkr]["Close"].rename(tkr) for tkr in tickers_list],
+                [data[sym]["Close"].rename(sym) for sym in symbols],
                 axis=1
             )
         except KeyError:
             st.error("⚠️ Downloaded data lacks a ‘Close’ column.")
             return pd.DataFrame()
     else:
-        # Single-ticker case
         if "Close" in data.columns:
             name = tickers if isinstance(tickers, str) else tickers[0]
             prices = data["Close"].to_frame(name=name)
@@ -76,55 +122,13 @@ def fetch_price_data(
             st.error("⚠️ Downloaded data has no ‘Close’ field.")
             return pd.DataFrame()
 
-    # Clean up
     prices.dropna(how="all", inplace=True)
     prices.fillna(method="ffill", inplace=True)
     return prices
 
-@st.cache_data(show_spinner=False)
-def load_asset_info(tickers: list[str]) -> pd.DataFrame:
-    """
-    Fetch sector, industry, market cap, country, P/E, and implied vol.
-    Returns a DataFrame with index = categories and columns = tickers.
-    """
-    info_dict = {
-        "Sector": {},
-        "Industry": {},
-        "Market Cap": {},
-        "Country": {},
-        "P/E Ratio": {}
-    }
-    for t in tickers:
-        tk = yf.Ticker(t)
-        info = tk.info
-        info_dict["Sector"][t] = info.get("sector", "N/A")
-        info_dict["Industry"][t] = info.get("industry", "N/A")
-        mc = info.get("marketCap", np.nan)
-        if pd.notna(mc):
-            # Format billions/trillions
-            if mc >= 1e12:
-                info_dict["Market Cap"][t] = f"${mc/1e12:.2f}T"
-            else:
-                info_dict["Market Cap"][t] = f"${mc/1e9:.2f}B"
-        else:
-            info_dict["Market Cap"][t] = "N/A"
-        info_dict["Country"][t] = info.get("country", "N/A")
-        pe = info.get("trailingPE", np.nan)
-        info_dict["P/E Ratio"][t] = f"{pe:.2f}" if pd.notna(pe) else "N/A"
 
-    df = pd.DataFrame(info_dict).T
-    return df
+# ─── Sidebar ────────────────────────────────────────────────────────────────
 
-@st.cache_data(show_spinner=False)
-def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change().dropna()
-
-@st.cache_data(show_spinner=False)
-def compute_correlation(returns: pd.DataFrame) -> pd.DataFrame:
-    # In percent
-    return returns.corr() * 100
-
-# ─── Sidebar ─────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("## Petrus Kung")
     st.markdown("📧  [petruskung@hotmail.com](mailto:petruskung@hotmail.com)")
@@ -132,38 +136,41 @@ with st.sidebar:
     st.markdown("---")
 
     st.markdown("## Portfolio Inputs")
+
+    # 1) load both universes
     sp500_tickers = load_sp500_tickers()
+    euro_tickers  = load_european_tickers()
+    all_tickers   = sp500_tickers + euro_tickers
+
+    # 2) let user multiselect from the combined list
     tickers = st.multiselect(
         "Choose Stock Tickers:",
-        options=sp500_tickers,
+        options=all_tickers,
         default=[],
-        help="Type to search S&P 500 tickers"
+        help="Type to search among US & major European tickers"
     )
+
+    # 3) Benchmark, dates, etc.
     benchmark = st.selectbox(
-    "Choose a Benchmark:",
-    [
-        "^GSPC",   # S&P 500 index
-        "SPY",     # S&P 500 ETF
-        "^IXIC",   # NASDAQ Composite
-        "QQQ",     # NASDAQ-100 ETF
-        "^DJI",    # Dow Jones Industrial
-        "DIA"      # Dow Jones ETF
-    ],
-    index=0
-)
+        "Choose a Benchmark:",
+        [
+            "^GSPC", "^IXIC", "^DJI",
+            "SPY", "QQQ", "DIA"
+        ],
+        index=0
+    )
     start_date = st.date_input("Start Date", value=pd.to_datetime("2010-01-01"))
     end_date   = st.date_input("End Date",   value=pd.to_datetime("2025-04-09"))
 
     st.markdown("---")
     st.markdown("#### Quick Guide")
-    st.markdown("📊 Asset Analysis  |  📈 Portfolio Comparison  |  ⚖️ Mean-Risk ")
+    st.markdown("📊 Asset Analysis  |  📈 Portfolio Comparison  |  ⚖️ Mean-Risk")
 
-# Warn if no tickers selected
+# ─── Validation ──────────────────────────────────────────────────────────────
 if not tickers:
     st.warning("Select at least one ticker in the sidebar to begin.")
     st.stop()
 
-# Load price data
 prices = fetch_price_data(tickers, start_date, end_date)
 if prices.empty:
     st.stop()
@@ -176,6 +183,42 @@ asset_tab, comp_tab, mr_tab = st.tabs([
 ])
 
 # -------------------- Asset Analysis --------------------
+@st.cache_data(show_spinner=False)
+def load_asset_info(tickers: list[str]) -> pd.DataFrame:
+    info_dict = {
+        "Sector": {}, "Industry": {}, "Market Cap": {},
+        "Country": {}, "P/E Ratio": {}
+    }
+    for t in tickers:
+        tk   = yf.Ticker(t)
+        info = tk.info
+        info_dict["Sector"][t]     = info.get("sector", "N/A")
+        info_dict["Industry"][t]   = info.get("industry", "N/A")
+
+        mc = info.get("marketCap", np.nan)
+        if pd.notna(mc):
+            if mc >= 1e12:
+                info_dict["Market Cap"][t] = f"${mc/1e12:.2f}T"
+            else:
+                info_dict["Market Cap"][t] = f"${mc/1e9:.2f}B"
+        else:
+            info_dict["Market Cap"][t] = "N/A"
+
+        info_dict["Country"][t]    = info.get("country", "N/A")
+
+        pe = info.get("trailingPE", np.nan)
+        info_dict["P/E Ratio"][t]  = f"{pe:.2f}" if pd.notna(pe) else "N/A"
+
+    return pd.DataFrame(info_dict).T
+
+@st.cache_data(show_spinner=False)
+def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    return prices.pct_change().dropna()
+
+@st.cache_data(show_spinner=False)
+def compute_correlation(returns: pd.DataFrame) -> pd.DataFrame:
+    return returns.corr() * 100
+
 with asset_tab:
     st.header("Asset Analysis")
     st.markdown(
@@ -436,19 +479,19 @@ with comp_tab:
     # 9) Risk Parity – Covariance Shrinkage
             if model == "Risk Parity – Covariance Shrinkage":
         # 1) compute & shrink
-                Σ0 = risk_models.sample_cov(train_prices)
-                shrunk = CovarianceShrinkage(Σ0).ledoit_wolf()
+                cov_mat = CovarianceShrinkage(train_prices).ledoit_wolf()
+                cov = pd.DataFrame(cov_mat, index=train_prices.columns, columns=train_prices.columns)
 
         # 2) clean as above
-                shrunk = pd.DataFrame(shrunk, index=Σ0.index, columns=Σ0.columns)
-                shrunk = shrunk.replace(0, np.nan).dropna(axis=0, how="any").dropna(axis=1, how="any")
+                cov.replace([np.inf, -np.inf], np.nan, inplace=True)
+                cov_clean = cov.dropna(axis=0, how="any").dropna(axis=1, how="any")
 
         # 3) HRP on the shrunk cov
-                hrp = HRPOpt(shrunk)
+                hrp = HRPOpt(cov_clean)
                 raw_w = hrp.optimize()
 
         # 4) re‐insert zeros for dropped tickers
-                for t in tickers:
+                for t in train_prices.columns:
                     raw_w.setdefault(t, 0.0)
                 return raw_w
     
