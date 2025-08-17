@@ -6,8 +6,11 @@ import yfinance as yf
 
 ### Line 98 is crucial for MTM value ###
 st.title("Advanced Options Pricing Dashboard")
+
 # ------------------------------------------------------
 # Section 1: To input different option strategies
+# ------------------------------------------------------
+
 strategies = [
     "Single Call", "Single Put", 
     "Call Spread", "Put Spread", "Straddle", "Strangle",
@@ -25,84 +28,224 @@ leg_config = {
 num_legs = leg_config[strategy]
 option_data = []
 
-# Code to enter requested strike, underlying price, rf rate
+# Lets the user input the strikes for each leg
 for i in range(num_legs):
     col1, col2 = st.columns(2)
     with col1:
         strike = st.number_input(f"Strike {i+1}", min_value=0.0, value=500.0 + i*5, key=f"strike_{i}")
     option_data.append({"strike": strike})
+    
+st.subheader("Underlying & IV Source")
 
+# 1) User chooses ticker
+ticker = st.text_input("Ticker (e.g., AAPL, SPY, TSLA)", value="AAPL").strip().upper()
 
-S0 = st.number_input("Underlying Price", min_value=0.0, value=500.0, key="underlying_price")
+# 2) The user chooses how we get IV from the nearest expiry:
+#  (A) "ATM option": pick the strike closest to spot and use its IV
+#  (B) "Highest-volume option": pick the most traded option and use its IV
+iv_mode = st.radio(
+    "Choose IV from nearest expiry",
+    ["ATM option", "Highest-volume option"],
+    index=0,
+    help="Both choices look at the nearest listed expiry."
+)
 
-## This rf rate is extracted from the 13-week Treasury Yield Curve from YFinance 
-# In case it could not be extracted, the function will fall back to a default rate of 3%
+@st.cache_data(ttl=60)
+# Cache for 60s to avoid repeated network calls on every rerun
+def fetch_spot_and_iv(tkr: str, mode: str):
+    import yfinance as yf
+    t = yf.Ticker(tkr)
+    s0 = None
+    try:
+        fi = getattr(t, "fast_info", {}) or {}
+        s0 = fi.get("last_price", None)
+    except Exception:
+        pass
+    if s0 is None:
+        try:
+            info = t.info or {}
+            s0 = info.get("regularMarketPrice", None)
+        except Exception:
+            pass
+    if s0 is None:
+        # if could not get a price for this ticker
+        return None, None, None, None
+    s0 = float(s0)
+
+    # Nearest expiry
+    try:
+        exps = t.options
+    except Exception:
+        exps = []
+    if not exps:
+        return s0, None, None, None
+    expiry = exps[0]
+
+    # Option chain
+    try:
+        chain = t.option_chain(expiry)
+    except Exception:
+        return s0, None, expiry, None
+
+    base = chain.calls.copy()
+    if base is None or base.empty:
+        base = chain.puts.copy()
+    if base is None or base.empty:
+        return s0, None, expiry, None
+
+    base = base.dropna(subset=["impliedVolatility"])
+    if base.empty:
+        return s0, None, expiry, None
+
+    if mode == "ATM option":
+        base["atm_dist"] = (base["strike"] - s0).abs()
+        row = base.sort_values("atm_dist").iloc[0]
+    else:  
+        if "volume" in base:
+            base["volume"] = base["volume"].fillna(0)
+            row = base.sort_values("volume", ascending=False).iloc[0]
+        else:
+            base["atm_dist"] = (base["strike"] - s0).abs()
+            row = base.sort_values("atm_dist").iloc[0]
+
+    sigma = float(row["impliedVolatility"])   # σ as decimal (e.g., 0.24)
+    chosen_strike = float(row["strike"])
+    return s0, sigma, expiry, chosen_strike
+
+# Fallback just in case --> Of course we can adjust later
+if "s0" not in st.session_state:
+    st.session_state.s0 = 500.0
+if "iv" not in st.session_state:
+    st.session_state.iv = 0.20
+
+# Fetch from yfinance
+S0_live, sigma_live, expiry_live, strike_for_iv = (None, None, None, None)
+if ticker:
+    S0_live, sigma_live, expiry_live, strike_for_iv = fetch_spot_and_iv(ticker, iv_mode)
+
+# Update session state if we got live values
+if S0_live is not None:
+    st.session_state.s0 = float(S0_live)
+if sigma_live is not None:
+    st.session_state.iv = float(sigma_live)
+
+# Variables used everywhere below
+S0 = float(st.session_state.s0)         
+sigma_input = float(st.session_state.iv) 
+
+# Display what we're using
+st.info(
+    f"**Live Spot (S₀):** ${S0:,.2f}  \n"
+    f"**IV source:** {iv_mode}  ·  "
+    f"**Nearest expiry:** {expiry_live if expiry_live else 'N/A'}  ·  "
+    f"**Chosen option strike:** {f'${strike_for_iv:,.2f}' if strike_for_iv else 'N/A'}  \n"
+    f"**Implied Vol (σ):** {sigma_input:.2%}"
+)
+
+## This rf rate is extracted from the 13-week Treasury Yield Curve from YFinance, and computes the 5-day average
+st.subheader("Market Parameters")
 tbill = yf.Ticker("^IRX")
 hist = tbill.history(period="5d")
-risk_free_rate = hist["Close"].iloc[-1]/100 if not hist.empty else 0.03
-st.write(f"Risk-Free Rate: {risk_free_rate:.4f}")
+risk_free_rate = hist['Close'].mean() / 100
+st.metric("Live Risk-Free Rate", f"{risk_free_rate:.4%}", "5-Day Avg of ^IRX")
 
 # Slider to choose TTM --> min = expiry; max = 2 years (just adjust "2.0" to any time you like)
 T = st.slider("Time-to-Maturity (Years)", 0.0, 2.0, 0.25, key="time_slider")
 
 # ------------------------------------------------------
 # Section 2: Code for Heston Model --> only need to adjust for stochastic vol
-def heston_price(S0, K, T, r, v0, theta, kappa, sigma, rho, option_type="call"):
-    def char_func(u, t, v0, theta, kappa, sigma, rho):
-        xi = kappa - sigma * rho * 1j * u
-        d = np.sqrt(xi**2 + sigma**2 * (u**2 + 1j * u))
-        g = (xi - d) / (xi + d)
-        C = r * 1j * u * t + (kappa * theta / sigma**2) * ((xi - d) * t - 2 * np.log((1 - g * np.exp(-d * t)) / (1 - g)))
-        D = (xi - d) / sigma**2 * (1 - np.exp(-d * t)) / (1 - g * np.exp(-d * t))
-        return np.exp(C + D * v0 + 1j * u * np.log(S0))
+# ------------------------------------------------------
+# IMPORTANT: This function expects v0 = variance (σ^2), not volatility σ.
 
-# These are norm functions
-    P1 = 0.5 + (1 / np.pi) * integrate.quad(lambda u: np.real(np.exp(-1j * u * np.log(K)) * char_func(u - 1j, T, v0, theta, kappa, sigma, rho) / (1j * u * S0)), 0, 100)[0]
-    P2 = 0.5 + (1 / np.pi) * integrate.quad(lambda u: np.real(np.exp(-1j * u * np.log(K)) * char_func(u, T, v0, theta, kappa, sigma, rho) / (1j * u)), 0, 100)[0]
-    
-    call_price = S0 * P1 - K * np.exp(-r * T) * P2
-    return call_price if option_type == "call" else call_price - S0 + K * np.exp(-r * T)
+def heston_price(S0, K, T, r, v0, theta, kappa, sigma_v, rho_sv, option_type="call"):
+    T_eff = max(float(T), 1e-8)  # guard near expiry
+    if S0 <= 0 or K <= 0:
+        return 0.0
+    x0 = np.log(S0)
+    def char_func(u):
+        iu = 1j * u
+        a = kappa * theta
+        b = kappa
+        d = np.sqrt((rho_sv * sigma_v * iu - b)**2 + sigma_v**2 * (iu + u**2))
+        g = (b - rho_sv * sigma_v * iu - d) / (b - rho_sv * sigma_v * iu + d)
+        # log branch-safe
+        log_term = np.log((1 - g * np.exp(-d * T_eff)) / (1 - g))
+        C = iu * (x0 + r * T_eff) + (a / (sigma_v**2)) * ((b - rho_sv * sigma_v * iu - d) * T_eff - 2.0 * log_term)
+        D = ((b - rho_sv * sigma_v * iu - d) / (sigma_v**2)) * ((1 - np.exp(-d * T_eff)) / (1 - g * np.exp(-d * T_eff)))
+        return np.exp(C + D * v0)
+    # Normalization for P1
+    phi_minus_i = char_func(-1j)
+    def integrand_P1(u):
+        return np.real(np.exp(-1j * u * np.log(K)) * char_func(u - 1j) / (1j * u * phi_minus_i))
+    def integrand_P2(u):
+        return np.real(np.exp(-1j * u * np.log(K)) * char_func(u) / (1j * u))
+    upper = 150.0
+    P1 = 0.5 + (1 / np.pi) * integrate.quad(integrand_P1, 0.0, upper, limit=200)[0]
+    P2 = 0.5 + (1 / np.pi) * integrate.quad(integrand_P2, 0.0, upper, limit=200)[0]
+    call_price = S0 * P1 - K * np.exp(-r * T_eff) * P2
+    call_price = float(np.real(call_price))
+    if option_type == "call":
+        return call_price
+    else:
+        # put via parity
+        return call_price - S0 + K * np.exp(-r * T_eff)
 
-# Compute the mechanism for specific strategies
-def calculate_strategy_price(S, iv, strategy, strikes, T, r):
+def calculate_strategy_price(S, v0, strategy, strikes, T, r):
+    # note: v0 is variance (σ^2). Keep names consistent.
+    args = dict(T=T, r=r, v0=v0, theta=0.04, kappa=1.0, sigma_v=0.2, rho_sv=-0.7)
     if strategy == "Single Call":
-        return heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call")
+        return heston_price(S, strikes[0], option_type="call", **args)
     elif strategy == "Single Put":
-        return heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put")
+        return heston_price(S, strikes[0], option_type="put", **args)
     elif strategy == "Call Spread":
-        return heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call") - heston_price(S, strikes[1], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call")
+        return heston_price(S, strikes[0], option_type="call", **args) - heston_price(S, strikes[1], option_type="call", **args)
     elif strategy == "Put Spread":
-        return heston_price(S, strikes[1], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put") - heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put")
+        return heston_price(S, strikes[1], option_type="put", **args) - heston_price(S, strikes[0], option_type="put", **args)
     elif strategy == "Straddle":
-        return heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call") + heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put")
+        return heston_price(S, strikes[0], option_type="call", **args) + heston_price(S, strikes[0], option_type="put", **args)
     elif strategy == "Strangle":
-        return heston_price(S, strikes[1], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call") + heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put")
+        return heston_price(S, strikes[1], option_type="call", **args) + heston_price(S, strikes[0], option_type="put", **args)
     elif strategy == "Iron Condor":
-        put_spread = heston_price(S, strikes[1], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put") - heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put")
-        call_spread = heston_price(S, strikes[3], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call") - heston_price(S, strikes[2], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call")
+        put_spread = heston_price(S, strikes[1], option_type="put", **args) - heston_price(S, strikes[0], option_type="put", **args)
+        call_spread = heston_price(S, strikes[3], option_type="call", **args) - heston_price(S, strikes[2], option_type="call", **args)
         return put_spread + call_spread
-# Butterflies are a bit more troublesome, needed Chatgpt for some help lol
     elif "Butterfly" in strategy:
-        if "Call" in strategy:
-            return (heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call") -
-                    2*heston_price(S, strikes[1], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call") +
-                    heston_price(S, strikes[2], T, r, iv, 0.04, 1.0, 0.2, -0.7, "call"))
-        else:
-            return (heston_price(S, strikes[0], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put") -
-                    2*heston_price(S, strikes[1], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put") +
-                    heston_price(S, strikes[2], T, r, iv, 0.04, 1.0, 0.2, -0.7, "put"))
+        typ = "call" if "Call" in strategy else "put"
+        return (heston_price(S, strikes[0], option_type=typ, **args)
+                - 2*heston_price(S, strikes[1], option_type=typ, **args)
+                + heston_price(S, strikes[2], option_type=typ, **args))
 
 # ------------------------------------------------------
-# Section 3: For the MTM value --> I used a default IV 4% to solve for the rf rate --> An extra step will be to use Newton-Raphson method to find IV --> Then invert to find 
-# option price --> This will be much more computationally-intensive, and the solution stability depends on deviation of initial guess from fair value
-current_iv = 0.04
-current_value = calculate_strategy_price(S0, current_iv, strategy, 
-                                       [leg["strike"] for leg in option_data], 
-                                       T, risk_free_rate)
-st.subheader(f"Current Mark-to-Market Value: ${current_value:.2f}")
+# Section 3: For the MTM value 
+# ------------------------------------------------------
+
+st.subheader("Current Mark-to-Market Value")
+
+live_spot_price = S0                 # Spot from the ticker
+live_sigma = sigma_input             # σ from the selected option of nearest expiry
+initial_variance = live_sigma ** 2   # v0 for Heston 
+
+st.info(f"""
+Calculating MTM using Heston model with these live parameters:
+- **Live Spot Price (S0):** ${live_spot_price:,.2f}
+- **Initial Variance (v0):** {initial_variance:.4f} (from selected option IV of {live_sigma:.2%})
+""")
+
+current_value = calculate_strategy_price(
+    live_spot_price,                  
+    initial_variance,               
+    strategy,
+    [leg["strike"] for leg in option_data],
+    T,
+    risk_free_rate
+)
+
+st.metric("Strategy MTM Value", f"${current_value:,.2f}")
 
 # ------------------------------------------------------
 # Section 4: Heatmap with $0.5 Stock Price increments 
+# ------------------------------------------------------
+
 st.subheader("Price Sensitivity Heatmap")
 stock_range = np.arange(S0-40, S0+40, 0.5)  ## If you want larger increments --> just adjust "0.5" to "1.0" or anything
 iv_range = np.linspace(0.01, 0.6, 20)
@@ -133,8 +276,13 @@ fig.update_layout(
 )
 st.plotly_chart(fig)
 
+live_volatility = st.session_state.iv 
+initial_variance = live_volatility ** 2
+
 # ------------------------------------------------------
 ## Section 5: Show Payoff & PnL section
+# ------------------------------------------------------
+
 st.subheader("Payoff Diagram & P&L Curves")
 
 # 1) Create a space that has a grid of 200 stock prices
@@ -184,19 +332,18 @@ taus = {
 
 # 4) Base premium at selected TTM
 base_premium = calculate_strategy_price(
-    S0, current_iv, strategy, K_list, T, risk_free_rate
+    S0, initial_variance, strategy, K_list, T, risk_free_rate
 )
 
-# 5) Build P&L curves
+# 5) Build P&L curves 
 pnl_curves = {}
 for label, tau_rem in taus.items():
     if tau_rem == 0:
-        # at expiry, payoff minus premium
         pnl_curves[label] = payoffs - base_premium
     else:
         vals = np.array([
             calculate_strategy_price(
-                S, current_iv, strategy, K_list, tau_rem, risk_free_rate
+                S, initial_variance, strategy, K_list, tau_rem, risk_free_rate
             ) for S in spot_grid
         ])
         pnl_curves[label] = vals - base_premium
@@ -211,7 +358,7 @@ fig.add_trace(go.Scatter(
     line=dict(color="black", dash="dash")
 ))
 
-# plot P&L curves for each tau --> Each has diff color --> Had to use chatgpt for the names of these colors lol
+# plot P&L curves for each tau --> Each has diff color --> Had to ask chatgpt for the names of these colors 
 colors = ["firebrick","royalblue","forestgreen","goldenrod"]
 for (label, pnl), color in zip(pnl_curves.items(), colors):
     fig.add_trace(go.Scatter(
@@ -219,6 +366,7 @@ for (label, pnl), color in zip(pnl_curves.items(), colors):
         mode="lines", name=f"P&L ({label})",
         line=dict(color=color)
     ))
+    
 ## One vital thing to note: Note we have 3M, 6M expiries. Suppose your TTM is 2M to expiry --> 3M and 6M lines will still appear, just in wiggly lines (can ignore them)
 fig.update_layout(
     title="Strategy Payoff & P&L Curves",
@@ -231,34 +379,30 @@ fig.update_layout(
 st.plotly_chart(fig, use_container_width=True)
 
 # ------------------------------------------------------
-## Section 6:
-# Greeks Calculation Section
+## Section 6: Show Greeks Calculations
+# ------------------------------------------------------
+
 st.subheader("Strategy Greeks")
 
 def compute_strategy_greeks(S0, iv, strategy, strikes, T, r):
     h = 0.01  # Perturbation size
     base_price = calculate_strategy_price(S0, iv, strategy, strikes, T, r)
     ## Note, I used Central Differences Method (within FDM) to calculate them
-    # Delta
+
     price_up = calculate_strategy_price(S0 + h, iv, strategy, strikes, T, r)
     price_down = calculate_strategy_price(S0 - h, iv, strategy, strikes, T, r)
     delta = (price_up - price_down) / (2 * h)
     
-    # Gamma
     gamma = (price_up - 2 * base_price + price_down) / (h ** 2)
     
-    # Vega
     vega_up = calculate_strategy_price(S0, iv + h, strategy, strikes, T, r)
     vega_down = calculate_strategy_price(S0, iv - h, strategy, strikes, T, r)
     vega = (vega_up - vega_down) / (2 * h)
     
-    # Theta
     theta = (calculate_strategy_price(S0, iv, strategy, strikes, T + h, r) - base_price) / h
     
-    # Volga
     volga = (vega_up - 2 * base_price + vega_down) / (h ** 2)
     
-    # Vanna
     vanna = (calculate_strategy_price(S0 + h, iv + h, strategy, strikes, T, r) -
             calculate_strategy_price(S0 + h, iv - h, strategy, strikes, T, r) -
             calculate_strategy_price(S0 - h, iv + h, strategy, strikes, T, r) +
@@ -273,12 +417,12 @@ def compute_strategy_greeks(S0, iv, strategy, strikes, T, r):
         "Vanna": vanna
     }
 
-## Note this also uses the default IV (4%) to compute the greeks
 # Calculate and display Greeks
-greeks = compute_strategy_greeks(S0, current_iv, strategy, 
-                                [leg["strike"] for leg in option_data], 
-                                T, risk_free_rate)
-
+greeks = compute_strategy_greeks(
+    S0, initial_variance, strategy, 
+    [leg["strike"] for leg in option_data], 
+    T, risk_free_rate
+)
 
 # Create columns for better display
 col1, col2, col3 = st.columns(3)
@@ -291,15 +435,6 @@ with col2:
 with col3:
     st.metric("Volga", f"{greeks['Volga']:.4f}")
     st.metric("Vanna", f"{greeks['Vanna']:.4f}")
-
-# Calculate current MTM value
-current_iv = 0.04  # Using model's volatility parameter
-current_mtm = calculate_strategy_price(S0, current_iv, strategy, 
-                                      [leg["strike"] for leg in option_data], 
-                                      T, risk_free_rate)
-
-st.subheader("Mark-to-Market & P&L Decomposition")
-st.markdown(f"**The PnL Change to the Option Position is: ${current_mtm:.2f}**")
 
 # Display P&L decomposition formula with current Greeks
 st.latex(r'''
@@ -317,8 +452,9 @@ st.write(f"""
 """)
 
 # ------------------------------------------------------
-# Section 7: 
-# Interactive P&L Calculator
+# Section 7: Interactive P&L Calculator
+# ------------------------------------------------------
+
 with st.expander("Calculate Hypothetical P&L"):
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -338,53 +474,53 @@ with st.expander("Calculate Hypothetical P&L"):
     st.metric("Estimated P&L", f"${pnl:.2f}", delta_color="off")
 
 # ------------------------------------------------------
-# Section 8:
-from plotly.subplots import make_subplots
+# Section 8: Strategy Value Surface 
+# ------------------------------------------------------
+
+st.subheader("Strategy Value Surface")
 
 # Build axes --> ttm, underlying which becomes surface panel
-times   = np.linspace(0.1, 1.0, 20)
+stock_range = np.arange(S0 * 0.7, S0 * 1.3, S0 / 100) # Dynamic range
+times = np.linspace(0.01, T if T > 0 else 1.0, 20)
 surface = np.zeros((len(times), len(stock_range)))
 strikes = [leg["strike"] for leg in option_data]
+
+# Generate surface data using the live initial_variance
 for i, t in enumerate(times):
     for j, S in enumerate(stock_range):
         surface[i, j] = calculate_strategy_price(
-            S, current_iv, strategy, strikes, t, risk_free_rate
+            S, initial_variance, strategy, strikes, t, risk_free_rate
         )
 
-fig = make_subplots(rows=1, cols=1, specs=[[{"type": "surface"}]])
-
-# Giving credits to chatgpt for lines 358-382, this helped with the presentation for IV surface
-# Create the surface with a custom hovertemplate:
+# Create the surface plot
 surface_trace = go.Surface(
     z=surface,
     x=stock_range,
     y=times,
     colorscale="Viridis",
     hovertemplate=(
-        "Stock Price: %{x:.0f}<br>"
-        "TTM: %{y:.4f} yrs<br>"
-        "IV: %{z:.4f}<extra></extra>"
+        "Stock Price: %{x:,.0f}<br>"
+        "TTM: %{y:.2f} yrs<br>"
+        "Strategy Value: $%{z:,.2f}<extra></extra>"
     )
 )
 fig_surface = go.Figure(data=[surface_trace])
 
 fig_surface.update_layout(
-    title="Implied Volatility Surface",
+    title=f"{strategy} Value Surface",
     scene=dict(
-        xaxis_title="Underlying Price",
+        xaxis_title="Underlying Price ($)",
         yaxis_title="Time to Maturity (yrs)",
-        zaxis_title="IV (%)",
-        # turn off the “floor” and side‐walls so panels don’t connect:
-        xaxis=dict(showbackground=False, showgrid=True),
-        yaxis=dict(showbackground=False, showgrid=True),
-        zaxis=dict(showbackground=False, showgrid=True),
-    )
+        zaxis_title="Strategy Value ($)",
+    ),
+    height=600
 )
 
 st.plotly_chart(fig_surface)
 
 # ------------------------------------------------------
-# Section 9:
+# Section 9: Building vol skew and vol term structure
+# ------------------------------------------------------
 
 # build moneyness and TTM axes
 moneyness = stock_range / S0
